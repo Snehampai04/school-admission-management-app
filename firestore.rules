@@ -1,0 +1,218 @@
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ───────────── AUTHENTICATION HELPERS ─────────────
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userProfileExists() {
+      return isSignedIn() &&
+        exists(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        );
+    }
+
+    function isParent() {
+      return userProfileExists() &&
+        get(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        ).data.role == 'parent';
+    }
+
+    function isAdmin() {
+      return userProfileExists() &&
+        get(
+          /databases/$(database)/documents/users/$(request.auth.uid)
+        ).data.role == 'admin';
+    }
+
+    function ownsAdmission(applicationId) {
+      return isParent() &&
+        exists(
+          /databases/$(database)/documents/admissions/$(applicationId)
+        ) &&
+        get(
+          /databases/$(database)/documents/admissions/$(applicationId)
+        ).data.parentId == request.auth.uid;
+    }
+
+
+    // ───────────── USERS ─────────────
+
+    match /users/{userId} {
+
+      allow create: if isSignedIn() &&
+        request.auth.uid == userId &&
+        request.resource.data.uid == request.auth.uid &&
+        request.resource.data.email == request.auth.token.email &&
+        request.resource.data.role == 'parent' &&
+        request.resource.data.keys().hasOnly([
+          'uid', 'email', 'name', 'role', 'createdAt'
+        ]);
+
+      allow read: if isSignedIn() &&
+        (request.auth.uid == userId || isAdmin());
+
+      allow update: if isSignedIn() &&
+        request.auth.uid == userId &&
+        resource.data.role == 'parent' &&
+        request.resource.data.role == 'parent' &&
+        request.resource.data.uid == resource.data.uid &&
+        request.resource.data.email == resource.data.email &&
+        request.resource.data.createdAt == resource.data.createdAt &&
+        request.resource.data.diff(resource.data)
+          .affectedKeys().hasOnly(['name']);
+
+      allow delete: if false;
+    }
+
+
+    // ───────────── ADMISSIONS ─────────────
+
+    match /admissions/{applicationId} {
+
+      allow create: if isParent() &&
+        request.resource.data.parentId == request.auth.uid &&
+        request.resource.data.status == 'pending';
+
+      allow read: if isAdmin() ||
+        (
+          isParent() &&
+          resource.data.parentId == request.auth.uid
+        );
+
+      // Admins can manage applications.
+      // Parents can update only their own payment status.
+
+      allow update: if isAdmin() ||
+        (
+          ownsAdmission(applicationId) &&
+          (
+            !('paymentStatus' in resource.data) ||
+            resource.data.paymentStatus != 'paid'
+          ) &&
+          request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['paymentStatus', 'updatedAt']) &&
+          request.resource.data.paymentStatus in ['paid', 'skipped']
+        );
+
+      allow delete: if false;
+    }
+
+
+    // ───────────── PAYMENTS ─────────────
+
+    match /payments/{paymentId} {
+
+      allow get: if isAdmin() ||
+        ownsAdmission(paymentId);
+
+      allow list: if isAdmin() ||
+        (
+          isParent() &&
+          resource.data.parentId == request.auth.uid
+        );
+
+      // Mock payment creation only.
+
+      allow create: if ownsAdmission(paymentId) &&
+        request.resource.data.admissionId == paymentId &&
+        request.resource.data.parentId == request.auth.uid &&
+        request.resource.data.studentName is string &&
+        request.resource.data.amount is number &&
+        request.resource.data.amount > 0 &&
+        request.resource.data.paymentMethod is string &&
+        request.resource.data.status == 'paid' &&
+        request.resource.data.transactionId is string &&
+        request.resource.data.timestamp is timestamp &&
+        request.resource.data.keys().hasOnly([
+          'admissionId',
+          'parentId',
+          'studentName',
+          'amount',
+          'paymentMethod',
+          'status',
+          'transactionId',
+          'timestamp'
+        ]);
+
+      allow update, delete: if false;
+    }
+
+
+    // ───────────── EXAM SLOTS ─────────────
+
+    match /exam_slots/{slotId} {
+
+      allow read: if isParent() || isAdmin();
+
+      allow create, delete: if isAdmin();
+
+      // Parents can only increment bookedCount by one.
+      // Admins can manage slots.
+
+      allow update: if isAdmin() ||
+        (
+          isParent() &&
+          request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['bookedCount', 'updatedAt']) &&
+          request.resource.data.bookedCount ==
+            resource.data.bookedCount + 1 &&
+          request.resource.data.bookedCount <=
+            resource.data.totalCapacity &&
+          resource.data.status == 'active'
+        );
+    }
+
+
+    // ───────────── EXAM BOOKINGS ─────────────
+
+    match /exam_bookings/{bookingId} {
+
+      // A parent can check an existing OR missing booking
+      // only when they own the corresponding admission.
+
+      allow get: if isAdmin() ||
+        ownsAdmission(bookingId);
+
+      // Parents can list only their own bookings.
+
+      allow list: if isAdmin() ||
+        (
+          isParent() &&
+          resource.data.parentId == request.auth.uid
+        );
+
+      // A parent can create one booking for their own
+      // approved admission and an active exam slot.
+
+      allow create: if isParent() &&
+        request.resource.data.parentId == request.auth.uid &&
+        request.resource.data.applicationId == bookingId &&
+        ownsAdmission(bookingId) &&
+        get(
+          /databases/$(database)/documents/admissions/$(bookingId)
+        ).data.status == 'approved' &&
+        exists(
+          /databases/$(database)/documents/exam_slots/$(request.resource.data.slotId)
+        ) &&
+        get(
+          /databases/$(database)/documents/exam_slots/$(request.resource.data.slotId)
+        ).data.status == 'active';
+
+      allow update, delete: if false;
+    }
+
+
+    // ───────────── DEFAULT DENY ─────────────
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
